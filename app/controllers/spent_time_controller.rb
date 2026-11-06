@@ -7,6 +7,9 @@ class SpentTimeController < ApplicationController
   helper :custom_fields
   include CustomFieldsHelper
 
+  before_action :require_login
+  before_action :authorize_spent_time
+
   # Show the initial form.
   # * If user has permissions to see spent time for every project
   # the users combobox is filled with all the users.
@@ -17,12 +20,10 @@ class SpentTimeController < ApplicationController
     @user = User.current
     @users = []
     if authorized_for?(:view_every_project_spent_time)
-      @users = User.active.order(:firstname)
+      @users = User.active.order(:firstname).to_a
     elsif authorized_for?(:view_others_spent_time)
-      projects = User.current.projects
-      projects.each { |project| @users.concat(project.users) }
-      @users.uniq!
-      @users.order(:firstname)
+      User.current.projects.each { |project| @users.concat(project.users) }
+      @users = @users.uniq.sort_by { |u| [u.firstname.to_s, u.lastname.to_s] }
     else
       @users = [@user]
     end
@@ -36,16 +37,20 @@ class SpentTimeController < ApplicationController
   # Show the report of spent time between two dates for an user
   def report
     @user = User.current
+    report_user = User.find_by_id(params[:user])
+    return render_404 unless report_user
+
     projects = nil
     if authorized_for?(:view_every_project_spent_time)
       # all project, which are not archived
       projects = Project.where('status!=9')
     elsif authorized_for?(:view_others_spent_time)
       projects = User.current.projects
+    elsif report_user != @user
+      return render_403
     end
-    make_time_entry_report(params[:from], params[:to], params[:user], projects)
-    another_user = User.find(params[:user])
-    @same_user = (@user.id == another_user.id)
+    make_time_entry_report(params[:from], params[:to], report_user, projects)
+    @same_user = (@user == report_user)
     respond_to do |format|
       format.js
     end
@@ -53,22 +58,18 @@ class SpentTimeController < ApplicationController
 
   # Delete a time entry
   def destroy_entry
-    @time_entry = TimeEntry.find(params[:id])
-    render_404 and return unless @time_entry
-    render_403 and return unless @time_entry.editable_by?(User.current)
+    @time_entry = TimeEntry.find_by_id(params[:id])
+    return render_404 unless @time_entry
+    return render_403 unless @time_entry.editable_by?(User.current)
     @time_entry.destroy
 
     @user = User.current
-    @from = params[:from].to_s.to_date
-    @to = params[:to].to_s.to_date
     make_time_entry_report(params[:from], params[:to], @user)
     respond_to do |format|
       format.js
     end
-  rescue ::ActionController::RedirectBackError
-    redirect_to :action => 'index'
   end
-  
+
   # Create a new time entry
   def create_entry
     @user = User.current
@@ -77,87 +78,69 @@ class SpentTimeController < ApplicationController
     begin
       @time_entry_date = params[:time_entry_spent_on].to_s.to_date
     rescue
-      raise 'invalid_date_error'
+      raise t('invalid_date_error')
     end
+    raise t('invalid_date_error') unless @time_entry_date
 
-    raise 'invalid_hours_error' unless is_numeric?(params[:time_entry][:hours].to_f)
-    params[:time_entry][:spent_on] = @time_entry_date
+    time_entry_params = params[:time_entry] || {}
+    time_entry_params[:spent_on] = @time_entry_date
     @from = params[:from].to_s.to_date
     @to = params[:to].to_s.to_date
 
-    # Save the new record
-    @time_entry = TimeEntry.new(:user => @user)
-    @time_entry.attributes = params[:time_entry]
+    @project = Project.find_by_id(params[:project_id])
+    raise t('cannot_find_project_error', :project_id => params[:project_id]) unless @project
+    raise t('not_allowed_error', :project => @project) unless @user.allowed_to?(:log_time, @project)
 
-    begin
-      @project = Project.find(params[:project_id])
-
-      unless allowed_project?(params[:project_id])
-        raise t('not_allowed_error', :project => @project)
-      end
-    rescue ActiveRecord::RecordNotFound
-      raise t('cannot_find_project_error', project_id=>params[:project_id])
-    end
-
+    @time_entry = TimeEntry.new
     @time_entry.project = @project
-    issue_id = (params[:issue_id] == nil) ? 0 : params[:issue_id].to_i
-    if issue_id > 0
-      begin
-        @issue = Issue.find(issue_id)
-      rescue ActiveRecord::RecordNotFound
-        raise t('issue_not_found_error', :issue_id=> issue_id)
-      end
-
-      if @project.id==@issue.project_id
-        @time_entry.issue = @issue
-      else
-        raise t('issue_not_in_project_error', issue=>@issue, project=>@project)
-      end
-    end
-
-    render_403 and return if @time_entry && !@time_entry.editable_by?(@user)
     @time_entry.user = @user
-    if @time_entry.save!
-      flash[:notice] = l('time_entry_added_notice')
-      respond_to do |format|
-        if @time_entry_date > @to
-          @to = @time_entry_date
-        elsif @time_entry_date < @from
-          @from = @time_entry_date
-        end
-        make_time_entry_report(@from, @to, @user)
-        format.js
+    @time_entry.author = @user if @time_entry.respond_to?(:author=)
+    @time_entry.safe_attributes = time_entry_params
+
+    issue_id = params[:issue_id].to_i
+    if issue_id > 0
+      @issue = Issue.find_by_id(issue_id)
+      raise t('issue_not_found_error', :issue_id => issue_id) unless @issue
+      unless @project.id == @issue.project_id
+        raise t('issue_not_in_project_error', :issue => @issue.id, :project => @project)
       end
+      @time_entry.issue = @issue
     end
-    rescue Exception => ex
-      respond_to do |format|
-        flash[:error] = ex.message
-        format.js { render 'spent_time/create_entry_error'}
-      end
+
+    @time_entry.save!
+    flash[:notice] = l('time_entry_added_notice')
+    if @time_entry_date > @to
+      @to = @time_entry_date
+    elsif @time_entry_date < @from
+      @from = @time_entry_date
+    end
+    make_time_entry_report(@from, @to, @user)
+    respond_to do |format|
+      format.js
+    end
+  rescue StandardError => ex
+    flash[:error] = ex.message
+    respond_to do |format|
+      format.js { render 'spent_time/create_entry_error' }
+    end
   end
 
   # Update the project's issues when another project is selected
   def update_project_issues
-    @to = params[:to].to_date
-    @from = params[:from].to_date
-    project = Project.find(params[:project_id])
-    @time_entry = TimeEntry.new(:project => project)
-    find_assigned_issues_by_project(params[:project_id])
+    @to = params[:to].to_s.to_date
+    @from = params[:from].to_s.to_date
+    project = Project.find_by_id(params[:project_id])
+    @time_entry = TimeEntry.new
+    @time_entry.project = project
+    find_assigned_issues_by_project(project)
     respond_to do |format|
       format.js
     end
   end
 
   private
-  
-  def is_numeric?(obj) 
-   obj.to_s.match(/\A[+-]?\d+?(\.\d+)?\Z/) == nil ? false : true
-  end
 
-  def allowed_project?(project_id)
-    project = Project.find(project_id)
-    allowed = project.allows_to?(:log_time)
-    allowed ? project : nil
+  def authorize_spent_time
+    render_403 unless authorized_for?(:view_spent_time)
   end
-
 end

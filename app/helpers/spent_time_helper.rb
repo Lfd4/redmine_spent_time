@@ -6,9 +6,8 @@ module SpentTimeHelper
   # Find issues assigned to the user and issues not assigned to him which the user has spent time
   def find_assigned_issues_by_project(project)
     @user = User.current
-    begin
-      @project = Project.find(project)
-    rescue
+    @project = project.is_a?(Project) ? project : Project.find_by_id(project)
+    if @project.nil?
       @assigned_issues = []
     else
       conditions = []
@@ -40,10 +39,12 @@ module SpentTimeHelper
   end
   
   # Render select project as tree
-  def render_project_tree    
+  # On change, reload the issue list; the form's fields go along (authenticity token,
+  # chosen date).
+  def render_project_tree
       select_tag('project_id', "<option value='-1'>-#{l(:select_project_option)}</option>".html_safe +
                            project_tree_options_for_select(user_projects_ordered),
-                           {:onchange => "$.post('#{spent_time_update_project_issues_path(:from => @from, :to => @to)}', {'_method':'post', 'project_id':this.value});".html_safe})    
+                           {:onchange => "$.post('#{spent_time_update_project_issues_path(:from => @from, :to => @to)}', $(this.form).serialize());".html_safe})
   end
 
   # Returns the users' projects ordered by name
@@ -68,11 +69,9 @@ module SpentTimeHelper
     arguments[:from] = @from
     arguments[:to] = @to
 
-    if User.exists?(user)
-      # Used in the view
-      query_user = User.find(user)
+    if user
       conditions << "#{TimeEntry.table_name}.user_id = :user"
-      arguments[:user] = user
+      arguments[:user] = user.is_a?(User) ? user.id : user.to_i
     end
 
     if projects
@@ -80,10 +79,10 @@ module SpentTimeHelper
       arguments[:projects] = projects.map { |c| c.id }
     end
 
-    @entries = TimeEntry.where(
-            conditions.join(' AND '), arguments,
-            :include => [:activity, :project, {:issue => [:tracker, :status]}],
-            :order => "#{TimeEntry.table_name}.spent_on DESC, #{Project.table_name}.name ASC, #{Tracker.table_name}.position ASC, #{Issue.table_name}.id ASC")
+    @entries = TimeEntry.where(conditions.join(' AND '), arguments).
+            includes(:activity, :project, :issue => [:tracker, :status]).
+            references(:projects, :issues, :trackers).
+            order("#{TimeEntry.table_name}.spent_on DESC, #{Project.table_name}.name ASC, #{Tracker.table_name}.position ASC, #{Issue.table_name}.id ASC")
     @entries_by_date = @entries.group_by(&:spent_on)
     @total_estimated_time = 0
     @entries.group_by(&:issue).each_key {|issue| 
@@ -140,7 +139,7 @@ module SpentTimeHelper
     end
 
     @from, @to = @to, @from if @from && @to && @from > @to
-    @from ||= (TimeEntry.minimum(:spent_on, :include => :project, :conditions => Project.allowed_to_condition(User.current, :view_time_entries)) || Date.today) - 1
+    @from ||= (TimeEntry.joins(:project).where(Project.allowed_to_condition(User.current, :view_time_entries)).minimum(:spent_on) || Date.today) - 1
     @to   ||= Date.today
   end
 
