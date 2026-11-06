@@ -187,4 +187,18 @@ class SpentTimeControllerTest < ActionController::TestCase
     assert_response :success
     assert_includes response.body, 'issue_id'
   end
+
+  # -- hour format (Redmine's time span format setting)
+
+  def test_hours_follow_the_time_span_format
+    log_time(2, 'formatted') # 2.5 hours
+    with_settings :timespan_format => 'minutes' do
+      spent_time_request(:get, :index)
+      assert_select 'tr.time-entry td.issue-hours', :text => '2:30'
+    end
+    with_settings :timespan_format => 'decimal' do
+      spent_time_request(:get, :index)
+      assert_select 'tr.time-entry td.issue-hours', :text => '2.50'
+    end
+  end
 end
